@@ -4010,6 +4010,8 @@ impl Agent {
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+
+            yield_to_steering: false,
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -4554,6 +4556,9 @@ impl Agent {
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            // This wrapper judges and writes steering itself; the loop only
+            // stops after a tool round when a message is waiting.
+            yield_to_steering: true,
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
@@ -4586,6 +4591,9 @@ impl Agent {
         // Steering prepared and judged at the end of a round, consumed at the
         // top of the next with no await in between.
         let mut steered_continuation: Option<Vec<ChatMessage>> = None;
+        // Provider-reported usage handed over by a run that yielded to
+        // steering, so the resumed run keeps the same token calibration.
+        let mut carried_reported_usage: Option<crate::agent::turn::ReportedRequestUsage> = None;
         for round in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
@@ -4714,7 +4722,7 @@ impl Agent {
                                 .as_ref()
                                 .map(crate::agent::tool_receipts::ReceiptScope::collector),
                             event_tx: Some(event_tx.clone()),
-                            steering: None,
+                            steering: steering_rx.as_deref_mut(),
                             new_messages_out: Some(&mut round_added),
                             image_cache: Some(crate::agent::turn::ToolLoopImageState {
                                 cache: &mut self.image_cache,
@@ -4749,6 +4757,7 @@ impl Agent {
                             }),
                         },
                         initial_ingress_subject,
+                        carried_reported_usage.take(),
                     )),
                 ),
             );
@@ -4970,6 +4979,36 @@ impl Agent {
                         final_context_limits: final_limits,
                         safeguard_fallback: turn_safeguard_fallback,
                     });
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::agent::turn::SteeringPending>()
+                        .is_some() =>
+                {
+                    // The loop stopped after a tool round because steering is
+                    // waiting. The round's messages are replayed above; commit
+                    // its text, then judge the steering exactly as at the end
+                    // of a round, so it reaches the model at the next step
+                    // instead of after the final answer. A cancelled turn
+                    // prepares nothing; the next round's top records the
+                    // interruption.
+                    if let Ok(pending) = error.downcast::<crate::agent::turn::SteeringPending>() {
+                        committed_response.push_str(&pending.display_text);
+                        carried_reported_usage = pending.reported_usage;
+                    }
+                    let notice = self.trim_history(Some(&turn_id));
+                    forward_history_trim_notice(&event_tx, notice).await;
+                    let cancelled = cancel_token
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                    if !cancelled {
+                        let pending = self.prepare_steering(&mut steering_rx, &turn_id).await;
+                        let admitted = self.readmit_prepared_steering(pending, &turn_id);
+                        if !admitted.is_empty() {
+                            steered_continuation = Some(admitted);
+                        }
+                    }
+                    continue;
                 }
                 Err(error) => {
                     // Model switch requested mid-turn: the unified loop
@@ -15203,6 +15242,306 @@ mod tests {
         );
     }
 
+    /// Steering sent while a tool runs reaches the model at the very next
+    /// step of the same turn, after that tool's result, not after the model's
+    /// final answer.
+    #[tokio::test]
+    async fn steering_sent_during_a_tool_reaches_the_next_step() {
+        // Sends once, during the first tool call only.
+        struct SteerDuringTool {
+            tx: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+        }
+        #[async_trait]
+        impl Tool for SteerDuringTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echo"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                let tx = self.tx.lock().take();
+                if let Some(tx) = tx {
+                    tx.send("steer-now".into())
+                        .await
+                        .expect("the running turn must accept steering");
+                }
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "tool-out".into(),
+                    error: None,
+                })
+            }
+        }
+        zeroclaw_api::mock_tool_attribution!(SteerDuringTool);
+
+        let tool_step = |id: &str| zeroclaw_providers::ChatResponse {
+            text: Some(String::new()),
+            tool_calls: vec![zeroclaw_providers::ToolCall {
+                id: id.into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(TranscriptCaptureModelProvider {
+            alias: "steer-step".into(),
+            // Two tool steps, then an answer: if steering waited for the
+            // final answer, neither the second nor third call would see it.
+            responses: Mutex::new(vec![
+                tool_step("call-1"),
+                tool_step("call-2"),
+                zeroclaw_providers::ChatResponse {
+                    text: Some("final".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+            seen_messages: seen.clone(),
+        });
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SteerDuringTool {
+                    tx: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("memory creation should succeed with valid config"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(256);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.turn_streamed_with_steering_state(
+                "start",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn must finish")
+        .expect("steered turn should succeed");
+        assert_eq!(outcome.response, "final");
+
+        let seen = seen.lock();
+        let second_call = seen.get(1).expect("the turn must make a second model call");
+        let steer_at = second_call
+            .iter()
+            .position(|m| m.role == "user" && m.content.ends_with("]\n\nsteer-now"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the step after the tool must see the steering message: {:?}",
+                    second_call
+                        .iter()
+                        .map(|m| (&m.role, &m.content))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let tool_result_at = second_call
+            .iter()
+            .position(|m| m.role == "tool" || m.content.contains("tool-out"))
+            .expect("the step after the tool must see its result");
+        assert!(
+            tool_result_at < steer_at,
+            "the steering message must follow the tool result it was sent during"
+        );
+        assert_eq!(
+            outcome
+                .new_messages
+                .iter()
+                .filter(|m| matches!(
+                    m,
+                    ConversationMessage::Chat(c) if c.role == "user" && c.content.ends_with("steer-now")
+                ))
+                .count(),
+            1,
+            "each steering message is persisted once as its own user turn"
+        );
+    }
+
+    /// The provider's reported usage from the step before a steering yield
+    /// still calibrates the step after it. Here that usage says the request
+    /// was far larger than estimated, so the resumed step must be refused
+    /// before dispatch instead of being sent on the raw estimate.
+    #[tokio::test]
+    async fn steering_yield_keeps_reported_usage_for_the_next_step() {
+        struct SteerDuringTool {
+            tx: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+        }
+        #[async_trait]
+        impl Tool for SteerDuringTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echo"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                let tx = self.tx.lock().take();
+                if let Some(tx) = tx {
+                    tx.send("steer-now".into())
+                        .await
+                        .expect("the running turn must accept steering");
+                }
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "tool-out".into(),
+                    error: None,
+                })
+            }
+        }
+        zeroclaw_api::mock_tool_attribution!(SteerDuringTool);
+
+        // Answers the first request with a tool call and a usage report a
+        // thousand times its own estimate; any later request gets a plain
+        // answer.
+        struct UndercountedProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl ModelProvider for UndercountedProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                Ok("ok".into())
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return Ok(zeroclaw_providers::ChatResponse {
+                        text: Some("final".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    });
+                }
+                let estimated = crate::agent::history::estimate_history_tokens(request.messages)
+                    + request
+                        .tools
+                        .map_or(0, crate::agent::history::estimate_tool_schema_tokens);
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "call-1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(estimated as u64 * 1_000),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                        output_tokens: Some(1),
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for UndercountedProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "undercounted"
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(UndercountedProvider {
+                calls: Arc::clone(&calls),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SteerDuringTool {
+                    tx: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("memory creation should succeed with valid config"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(256);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.turn_streamed_with_steering_state(
+                "start",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn must finish");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the step after the yield must be refused on the carried usage, not dispatched"
+        );
+        let mut calibrated_trim = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::HistoryTrimmed {
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                ..
+            } = event
+            {
+                calibrated_trim = true;
+            }
+        }
+        assert!(
+            calibrated_trim,
+            "the resumed step must count its request with the carried calibration"
+        );
+    }
+
     #[tokio::test]
     async fn tree_budget_final_completion_is_terminal_when_steering_arrives() {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -19181,6 +19520,123 @@ model_provider = "custom.only"
                 error: None,
             })
         }
+    }
+
+    /// A tool that queues a model switch and, in the same call, a steering
+    /// message. The switch must still apply: steering waits for the switched
+    /// provider instead of resuming on the old one.
+    struct SwitchAndSteerTool {
+        steer: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+    }
+
+    #[async_trait]
+    impl Tool for SwitchAndSteerTool {
+        fn name(&self) -> &str {
+            "model_switch_trigger"
+        }
+        fn description(&self) -> &str {
+            "test tool: queues a model switch and a steering message"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            let state = crate::agent::turn::current_model_switch_state()?;
+            *state.lock().unwrap() = Some(("ollama".to_string(), "llama3".to_string()));
+            let steer = self.steer.lock().take();
+            if let Some(steer) = steer {
+                steer
+                    .send("steer-during-switch".into())
+                    .await
+                    .expect("the running turn must accept steering");
+            }
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "model switch queued".into(),
+                error: None,
+            })
+        }
+    }
+    zeroclaw_api::mock_tool_attribution!(SwitchAndSteerTool);
+
+    #[test]
+    fn steering_in_the_same_batch_as_a_model_switch_keeps_the_switch() {
+        let initial_calls = Arc::new(Mutex::new(0usize));
+        let provider = Box::new(StreamSwitchTriggerProvider {
+            call_count: Arc::clone(&initial_calls),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation"),
+        );
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(zeroclaw_config::schema::Config {
+                reliability: zeroclaw_config::schema::ReliabilityConfig {
+                    provider_retries: 0,
+                    provider_backoff_ms: 0,
+                    ..zeroclaw_config::schema::ReliabilityConfig::default()
+                },
+                ..zeroclaw_config::schema::Config::default()
+            })),
+            live_config: None,
+            live: None,
+        };
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let mut agent = Agent::builder()
+            .model_provider(provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SwitchAndSteerTool {
+                    steer: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_provider_name("openai".to_string())
+            .model_name("gpt-4o-mini".to_string())
+            .provider_switch_config(switch_cfg)
+            .build()
+            .expect("agent builder");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+            // The switched provider has no live server, so the turn errors
+            // after the switch; the timeout only guards against a hang.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                agent.turn_streamed_with_steering_state(
+                    "please switch the model",
+                    event_tx,
+                    None,
+                    Some(&mut steering_rx),
+                ),
+            )
+            .await;
+        });
+
+        assert_eq!(
+            (
+                agent.model_provider_name.as_str(),
+                agent.model_name.as_str()
+            ),
+            ("ollama", "llama3"),
+            "steering in the same batch must not drop the requested model switch"
+        );
+        assert_eq!(
+            *initial_calls.lock(),
+            1,
+            "the steered round must not go back to the original provider"
+        );
     }
 
     #[test]
