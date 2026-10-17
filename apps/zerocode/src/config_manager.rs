@@ -486,6 +486,7 @@ pub(crate) struct App {
     select_cursor: usize,
     select_items: Vec<String>,
     status_msg: Option<String>,
+    application_feedback: crate::config_application::ApplicationFeedback,
     // Filter state: None = inactive, Some(buf) = active filter
     filter: Option<String>,
     filter_cursor: usize,
@@ -562,6 +563,7 @@ impl App {
             select_cursor: 0,
             select_items: Vec::new(),
             status_msg: None,
+            application_feedback: crate::config_application::ApplicationFeedback::new(),
             filter: None,
             filter_cursor: 0,
             filter_origin: None,
@@ -594,6 +596,15 @@ impl App {
         }
     }
 
+    /// Refresh application feedback without blocking terminal input.
+    pub(crate) fn tick_application_status(&mut self, active: bool) {
+        if active && self.section == ConfigSection::Zeroclaw {
+            self.application_feedback.tick(&self.rpc);
+        } else {
+            self.application_feedback.deactivate();
+        }
+    }
+
     /// Load initial data from the daemon. Call once before draw/handle_key.
     pub(crate) async fn init(&mut self) -> Result<()> {
         self.sections = self.rpc.config_sections().await?;
@@ -620,6 +631,11 @@ impl App {
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(0),
+                Constraint::Length(if self.section == ConfigSection::Zeroclaw {
+                    2
+                } else {
+                    0
+                }),
                 Constraint::Length(1),
             ])
             .split(area);
@@ -632,11 +648,30 @@ impl App {
             return;
         }
 
-        // Unified bottom-left action hint, matching the Dashboard/Logs panes.
+        let mut hint = self.bottom_hint();
+        if self.can_view_application_status() {
+            hint.push_str(&format!(
+                "  {}={}",
+                tab_key(crate::keymap::ConfigTabAction::ApplicationStatus),
+                crate::i18n::t("zc-config-application-view")
+            ));
+        }
         frame.render_widget(
-            Paragraph::new(Span::styled(self.bottom_hint(), theme::dim_style())),
+            Paragraph::new(Span::styled(hint, theme::dim_style())),
+            chunks[3],
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                self.application_feedback.summary(),
+                theme::warn_style(),
+            ))
+            .wrap(Wrap { trim: false }),
             chunks[2],
         );
+        if self.application_feedback.details_open() {
+            self.application_feedback.draw_details(frame, body);
+            return;
+        }
 
         // Split-pane: the section list stays pinned on the left; the highlighted
         // section's content is eagerly loaded and embedded on the right for a
@@ -723,9 +758,28 @@ impl App {
         }
     }
 
+    fn can_view_application_status(&self) -> bool {
+        self.section == ConfigSection::Zeroclaw
+            && self.application_feedback.has_content()
+            && !matches!(
+                self.screen,
+                Screen::FieldEdit { .. } | Screen::AliasCreate { .. }
+            )
+            && self.filter.is_none()
+            && self.personality_active_file.is_none()
+            && self.skills_active.is_none()
+    }
+
     fn bottom_hint(&self) -> String {
         use crate::keymap::{ConfigEditorAction as E, ConfigTabAction as T};
 
+        if self.application_feedback.details_open() {
+            return format!(
+                "{}={}",
+                tab_key(T::Back),
+                crate::i18n::t("zc-config-help-back")
+            );
+        }
         let default = || format!(" ?={}", crate::i18n::t("zc-config-footer-action-help"));
 
         match &self.screen {
@@ -955,6 +1009,18 @@ impl App {
     }
 
     async fn handle_key_inner(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
+        if self.section == ConfigSection::Zeroclaw {
+            if self.application_feedback.handle_key(key) {
+                return Ok(false);
+            }
+            if self.can_view_application_status()
+                && crate::keymap::ConfigTabAction::from_chord(&key)
+                    == Some(crate::keymap::ConfigTabAction::ApplicationStatus)
+            {
+                self.application_feedback.toggle_details();
+                return Ok(false);
+            }
+        }
         self.status_msg = None;
 
         // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
@@ -1066,6 +1132,9 @@ impl App {
         term: &mut Term,
     ) -> Result<()> {
         use crate::mouse;
+        if self.application_feedback.details_open() {
+            return Ok(());
+        }
 
         // Section tab-bar click switches sub-tab in either section.
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
@@ -1861,7 +1930,7 @@ impl App {
         Ok(())
     }
 
-    async fn prefill_cost_rates_from_catalog(&self, base_path: &str, resource: &str) {
+    async fn prefill_cost_rates_from_catalog(&mut self, base_path: &str, resource: &str) {
         let Some(provider_type) = base_path.strip_prefix("cost.rates.providers.models.") else {
             return;
         };
@@ -1885,7 +1954,9 @@ impl App {
         for (field, value) in fields {
             if let Some(v) = value {
                 let prop = format!("{base_path}.{resource}.{field}");
-                let _ = self.rpc.config_set(&prop, serde_json::json!(v)).await;
+                if let Ok(revision) = self.rpc.config_set(&prop, serde_json::json!(v)).await {
+                    self.application_feedback.record_saved(prop, revision);
+                }
             }
         }
     }
@@ -2513,7 +2584,11 @@ impl App {
                     let alias = self.aliases[self.alias_cursor].clone();
                     let map_path = map_path.clone();
                     match self.rpc.config_map_key_delete(&map_path, &alias).await {
-                        Ok(()) => {
+                        Ok(result) => {
+                            if result.changed {
+                                self.application_feedback
+                                    .record_saved(format!("{map_path}.{alias}"), result.revision);
+                            }
                             self.status_msg = Some(crate::i18n::t_args(
                                 "zc-config-status-alias-deleted",
                                 &[("alias", &alias)],
@@ -2630,7 +2705,11 @@ impl App {
             {
                 let resource = self.cost_resources[self.cost_cursor].clone();
                 match self.rpc.config_map_key_delete(&base, &resource).await {
-                    Ok(()) => {
+                    Ok(result) => {
+                        if result.changed {
+                            self.application_feedback
+                                .record_saved(format!("{base}.{resource}"), result.revision);
+                        }
                         self.status_msg = Some(crate::i18n::t_args(
                             "zc-config-status-alias-deleted",
                             &[("alias", &resource)],
@@ -2811,7 +2890,11 @@ impl App {
                 } = std::mem::replace(&mut self.screen, Screen::SectionList)
                 {
                     match self.rpc.config_map_key_create(&map_path, &name).await {
-                        Ok(()) => {
+                        Ok(result) => {
+                            if result.changed {
+                                self.application_feedback
+                                    .record_saved(format!("{map_path}.{name}"), result.revision);
+                            }
                             self.prefill_cost_rates_from_catalog(&map_path, &name).await;
                             let prefix = format!("{}.{}", map_path, name);
                             let mut bc = breadcrumb;
@@ -3153,7 +3236,9 @@ impl App {
                     if let Screen::FieldList { prefix, .. } = &self.screen {
                         let prefix = prefix.clone();
                         match self.rpc.config_delete(&prop).await {
-                            Ok(()) => {
+                            Ok(revision) => {
+                                self.application_feedback
+                                    .record_saved(prop.clone(), revision);
                                 self.status_msg = Some(crate::i18n::t_args(
                                     "zc-config-status-field-reset",
                                     &[("prop", &prop)],
@@ -4115,14 +4200,14 @@ impl App {
         let prop = format!("{map_path}.{key}");
         let value = serde_json::Value::String(self.edit_buf.clone());
         match self.rpc.config_set(&prop, value).await {
-            Ok(()) => {
+            Ok(revision) => {
+                self.application_feedback
+                    .record_saved(prop.clone(), revision);
                 self.secret_map_entry_key = None;
                 self.edit_buf.clear();
                 self.edit_cursor = 0;
-                self.status_msg = Some(crate::i18n::t_args(
-                    "zc-config-status-field-set",
-                    &[("prop", &prop)],
-                ));
+                // The application summary below names the saved field.
+                self.status_msg = None;
                 self.pop_to_field_list_keep_cursor().await?;
             }
             Err(e) => {
@@ -4177,11 +4262,11 @@ impl App {
                             entries.into_iter().map(serde_json::Value::String).collect(),
                         );
                         match self.rpc.config_set(&prop, value).await {
-                            Ok(()) => {
-                                self.status_msg = Some(crate::i18n::t_args(
-                                    "zc-config-status-field-set",
-                                    &[("prop", &prop)],
-                                ));
+                            Ok(revision) => {
+                                self.application_feedback
+                                    .record_saved(prop.clone(), revision);
+                                // The application summary below names the saved field.
+                                self.status_msg = None;
                                 self.pop_to_field_list_keep_cursor().await?;
                             }
                             Err(e) => {
@@ -4227,11 +4312,11 @@ impl App {
                     let prop = field.path.clone();
                     let value = serde_json::Value::String(self.edit_buf.clone());
                     match self.rpc.config_set(&prop, value).await {
-                        Ok(()) => {
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-field-set",
-                                &[("prop", &prop)],
-                            ));
+                        Ok(revision) => {
+                            self.application_feedback
+                                .record_saved(prop.clone(), revision);
+                            // The application summary below names the saved field.
+                            self.status_msg = None;
                             self.pop_to_field_list_keep_cursor().await?;
                         }
                         Err(e) => {
@@ -4315,11 +4400,11 @@ impl App {
             let prop = self.fields[*field_idx].path.clone();
             let value = serde_json::Value::String(chosen.clone());
             match self.rpc.config_set(&prop, value).await {
-                Ok(()) => {
-                    self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-field-set",
-                        &[("prop", &prop)],
-                    ));
+                Ok(revision) => {
+                    self.application_feedback
+                        .record_saved(prop.clone(), revision);
+                    // The application summary below names the saved field.
+                    self.status_msg = None;
                     self.pop_to_field_list_keep_cursor().await?;
                 }
                 Err(e) => {
@@ -5365,6 +5450,9 @@ impl App {
     /// create/rename, personality/skills editor). Filters out the bracket-paste
     /// terminator bytes and normalises CRLF.
     pub(crate) async fn handle_paste(&mut self, text: &str) {
+        if self.application_feedback.details_open() {
+            return;
+        }
         // Normalise line endings — bracketed paste can deliver \r, \r\n,
         // or \n depending on terminal.
         let cleaned: String = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -5499,6 +5587,12 @@ impl crate::widgets::HelpContext for App {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::keymap::ConfigTabAction as A;
         use crate::widgets::HelpEntry as E;
+        if self.application_feedback.details_open() {
+            return crate::widgets::HelpNode::entries(vec![
+                E::new(nav_keys_split(), crate::i18n::t("zc-config-help-navigate")),
+                E::new(tab_keys(A::Back), crate::i18n::t("zc-config-help-back")),
+            ]);
+        }
         // Section switch is available in either sub-tab.
         let section_nav = E::new(
             [tab_keys(A::SectionNext), tab_keys(A::SectionPrev)].concat(),
@@ -5826,6 +5920,10 @@ impl App {
         entries.push(E::new(
             tab_keys(A::DeleteRow),
             crate::i18n::t("zc-config-help-reset-default"),
+        ));
+        entries.push(E::new(
+            tab_keys(A::ApplicationStatus),
+            crate::i18n::t("zc-config-application-view"),
         ));
         entries.push(E::new(
             tab_keys(A::BeginSearch),
@@ -8377,7 +8475,7 @@ mod tests {
                             .to_string(),
                         req["params"]["value"].clone(),
                     ));
-                    serde_json::json!({})
+                    serde_json::json!({"revision": {"epoch": "test-epoch", "sequence": 1}})
                 } else if method == crate::client::method::CONFIG_MAP_KEYS {
                     serde_json::json!({ "keys": ["first", "second"] })
                 } else if method == crate::client::method::CONFIG_LIST {
@@ -8395,6 +8493,21 @@ mod tests {
                         serde_json::to_value(&first).unwrap(),
                         serde_json::to_value(&second).unwrap(),
                     ] })
+                } else if method == crate::client::method::CONFIG_MAP_KEY_CREATE {
+                    serde_json::json!({"created": false})
+                } else if method == crate::client::method::CONFIG_STATUS {
+                    serde_json::json!({ "application": {
+                        "published_revision": {"epoch": "test-epoch", "sequence": 1},
+                        "record_limit": 512, "truncated": false,
+                        "records": [
+                            {"path": ["a", "second"], "target": {"kind": "daemon"},
+                             "revision": {"epoch": "test-epoch", "sequence": 1},
+                             "outcome": "queued_for_reload", "reason": "daemon_reload_required"},
+                            {"path": ["a", "second"], "target": {"kind": "session", "id": "test-session", "generation": 7},
+                             "revision": {"epoch": "test-epoch", "sequence": 1},
+                             "outcome": "applied_live"}
+                        ]
+                    }})
                 } else {
                     serde_json::json!({})
                 };
@@ -8402,6 +8515,127 @@ mod tests {
             }
         });
         (manager, calls)
+    }
+
+    #[tokio::test]
+    async fn config_application_noop_alias_creation_preserves_the_last_save() {
+        let (mut manager, _) = responding_manager();
+        manager
+            .application_feedback
+            .record_saved("previous edit".into(), None);
+        manager.screen = Screen::AliasCreate {
+            section_idx: 0,
+            map_path: "model_routes".into(),
+            breadcrumb: vec!["Model routes".into()],
+        };
+        manager.edit_buf = "existing".into();
+        manager
+            .handle_alias_create(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .application_feedback
+                .summary()
+                .contains("previous edit")
+        );
+        assert!(
+            !manager
+                .application_feedback
+                .summary()
+                .contains("model_routes.existing")
+        );
+    }
+
+    #[tokio::test]
+    async fn config_application_feedback_follows_the_real_config_save_hook() {
+        let (mut manager, calls) = responding_manager();
+        manager.sections = vec![typed_section("a")];
+        manager.fields = vec![field("a.first"), field("a.second")];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.edit_buf = "new".into();
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!("new")));
+        assert!(
+            manager
+                .application_feedback
+                .summary()
+                .contains("can't confirm")
+        );
+        // One line, not two: the save names the field only in the summary.
+        assert_eq!(manager.status_msg, None);
+        manager.tick_application_status(true);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+            manager.tick_application_status(true);
+            if manager
+                .application_feedback
+                .summary()
+                .contains("already been applied")
+            {
+                break;
+            }
+        }
+        let summary = manager.application_feedback.summary();
+        assert!(summary.contains("a.second"));
+        assert!(summary.contains("Open sessions already use it"));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+        let output = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(output.contains("a.second"));
+        assert!(output.contains("Open sessions already use it"));
+        let buffer = terminal.backend().buffer();
+        let row = (0..buffer.area.height)
+            .find(|&y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .starts_with("Saved ")
+            })
+            .expect("summary row");
+        assert_eq!(buffer[(0, row)].fg, crate::theme::warn_style().fg.unwrap());
+        manager.application_feedback.toggle_details();
+        terminal
+            .draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+        let output = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(output.contains("test-epoch"));
+        assert!(output.contains("test-session"));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["config/set", "config/list", "config/status"]
+        );
+        manager.tick_application_status(false);
+        assert!(
+            manager
+                .application_feedback
+                .summary()
+                .contains("can't confirm")
+        );
     }
 
     #[tokio::test]
