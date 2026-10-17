@@ -31430,6 +31430,55 @@ mod tests {
         active
     }
 
+    // Up/Down are also chat browse chords. While the slash-command popup is
+    // open they must move its highlight, not scroll the transcript.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn arrow_keys_move_the_slash_command_highlight_in_chat_and_code() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let mut chat = chat_with_active_input(kind);
+            {
+                let state = active_state(&mut chat);
+                state.input_bar.clear_input();
+                state.input_bar.insert_text("/");
+                let (count, index, open) = state.input_bar.autocomplete_snapshot();
+                assert!(open && count >= 2);
+                assert_eq!(index, Some(0));
+            }
+            let mut term = key_term();
+
+            chat.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+                .await;
+            assert_eq!(
+                active_state(&mut chat).input_bar.autocomplete_snapshot().1,
+                Some(1),
+                "{kind:?}: Down must move the highlight"
+            );
+            chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut term)
+                .await;
+            assert_eq!(
+                active_state(&mut chat).input_bar.autocomplete_snapshot().1,
+                Some(0),
+                "{kind:?}: Up must move the highlight"
+            );
+
+            chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+                .await;
+            let state = active_state(&mut chat);
+            assert!(
+                !state.input_bar.autocomplete_snapshot().2,
+                "{kind:?}: Esc must close the popup"
+            );
+            assert!(!state.in_browse_mode());
+        }
+    }
+
     // Keymap overrides are process-global; retain the existing test lock across
     // async dispatch so another override test cannot change the routing basis.
     #[allow(clippy::await_holding_lock)]
@@ -31506,6 +31555,86 @@ mod tests {
                 !chat.wants_quit_chord(&copy),
                 "browse mode must not claim input copy"
             );
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn composer_vertical_navigation_precedes_transcript_in_chat_and_code() {
+        use crate::keymap::{Chord, InputBarAction as A, overrides};
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            for (text, width) in [("alpha\nbravo", 30), ("alpha bravo delta", 9)] {
+                let mut chat = chat_with_active_input(kind);
+                let active = active_state(&mut chat);
+                active.input_bar.load_for_edit(text.into(), Vec::new());
+                let mut renderer =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 12)).unwrap();
+                renderer
+                    .draw(|frame| {
+                        active.input_bar.render(
+                            frame,
+                            Rect::new(0, 0, width, 12),
+                            false,
+                            true,
+                            &TurnStatus::Idle,
+                            Instant::now(),
+                            None,
+                        );
+                    })
+                    .unwrap();
+                chat.handle_key(up, &mut term).await;
+                assert!(active_state(&mut chat).input_bar.cursor() < text.len());
+                chat.handle_key(down, &mut term).await;
+                assert_eq!(active_state(&mut chat).input_bar.cursor(), text.len());
+                assert_eq!(active_state(&mut chat).input_bar.input(), text);
+
+                active_state(&mut chat).pending_elicitation = Some(single_elicitation());
+                chat.handle_key(up, &mut term).await;
+                assert_eq!(active_state(&mut chat).input_bar.cursor(), text.len());
+                active_state(&mut chat).pending_elicitation = None;
+                active_state(&mut chat).browse_cursor = Some(0);
+                chat.handle_key(up, &mut term).await;
+                assert_eq!(active_state(&mut chat).input_bar.cursor(), text.len());
+                active_state(&mut chat).browse_cursor = None;
+
+                overrides::set_row(
+                    A::TAG,
+                    "history_prev",
+                    vec![Chord::with(KeyCode::Up, KeyModifiers::ALT)],
+                );
+                chat.handle_key(up, &mut term).await;
+                assert_eq!(active_state(&mut chat).input_bar.cursor(), text.len());
+                chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &mut term)
+                    .await;
+                assert!(active_state(&mut chat).input_bar.cursor() < text.len());
+                overrides::reset();
+
+                let active = active_state(&mut chat);
+                active.input_bar.clear_input();
+                active.last_total_rows = 40;
+                active.last_inner_height = 10;
+                active.scroll_offset = 20;
+                active.pinned_to_bottom = false;
+                chat.handle_key(up, &mut term).await;
+                assert_eq!(active_state(&mut chat).scroll_offset, 19);
+                chat.handle_key(down, &mut term).await;
+                assert_eq!(active_state(&mut chat).scroll_offset, 20);
+            }
         }
     }
 
